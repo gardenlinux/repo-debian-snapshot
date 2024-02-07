@@ -1,0 +1,3 @@
+DPkg::Post-Invoke { "/bin/rm -rf /var/cache/apt"; };
+Dir::Cache::srcpkgcache "";
+Dir::Cache::pkgcache "";

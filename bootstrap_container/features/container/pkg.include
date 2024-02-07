@@ -1,0 +1,6 @@
+build-essential
+ca-certificates
+debhelper
+devscripts
+fakeroot
+git

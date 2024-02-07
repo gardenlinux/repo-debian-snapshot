@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+
+set -eufo pipefail
+
+dir="$(realpath "$(dirname "${BASH_SOURCE[0]}")")"
+
+parse_pkgs() (
+	"$dir/parse_pkgs" "$@"
+)
+
+download_gpg() (
+	echo "$1" >&2
+	file="$(mktemp)"
+	if curl "$1" | gpg --verify --output - > "$file"; then
+		echo "$file"
+	else
+		rm "$file"
+		exit 1
+	fi
+)
+
+download_sha256sum() (
+	echo "$2" >&2
+	file="$(mktemp)"
+	curl "$2" > "$file"
+	hash="$(sha256sum "$file" | head -c 64)"
+	if [ "$hash" != "$1" ]; then
+		echo "invalid sha256sum" >&2
+		rm "$file"
+		exit 1
+	fi
+	echo "$file"
+)
+
+download_from_release() (
+	repo="$1"
+	dist="$2"
+	path="$3"
+	hash="$(awk -v file="$path" '!/^ / { flag=0 } flag && $3 == file { print $1 } /^SHA256:$/ { flag = 1 }')"
+	file="$(download_sha256sum "$hash" "http://$repo/dists/$dist/$path")"
+	echo "$file"
+)
+
+main() (
+	target_dir=
+	repo=deb.debian.org/debian
+	dist=testing
+	description=snapshot
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-t|--target-dir)
+				target_dir="$2"
+				shift 2
+				;;
+			-r|--repo)
+				repo="$2"
+				shift 2
+				;;
+			-d|--dist)
+				dist="$2"
+				shift 2
+				;;
+			-i|--description)
+				description="$2"
+				shift 2
+				;;
+			*)
+				break
+				;;
+		esac
+	done
+
+	[ -n "$target_dir" ]
+	[ -n "$repo" ]
+	[ -n "$dist" ]
+
+	release="$(download_gpg "http://$repo/dists/$dist/InRelease")"
+	date="$(awk -F ': ' '$1 == "Date" { print $2 }' < "$release")"
+	timestamp="$(date -d "$date" '+%s')"
+
+	index_files="$(mktemp)"
+	mkdir -p "$target_dir"
+	truncate -s 0 "$target_dir/mirrorlist"
+	for path in main/binary-{all,amd64,arm64}/Packages main/source/Sources; do
+		mkdir -p "$target_dir/$(dirname "$path")"
+		file="$(download_from_release "$repo" "$dist" "$path.gz" < "$release")"
+		mirrorlist="$(mktemp)"
+		gzip -d < "$file" | parse_pkgs "source_file_prefix=http://$repo/" "mirrorlist=$mirrorlist" > "$target_dir/$path"
+		rm "$file"
+		cat "$mirrorlist" >> "$target_dir/mirrorlist"
+		rm "$mirrorlist"
+		size="$(wc -c "$target_dir/$path" | cut -d ' ' -f 1)"
+		hash="$(sha256sum "$target_dir/$path" | head -c 64)"
+		echo " $hash $size $path" >> "$index_files"
+		gzip < "$target_dir/$path" > "$target_dir/$path.gz"
+		rm "$target_dir/$path"
+		size="$(wc -c "$target_dir/$path.gz" | cut -d ' ' -f 1)"
+		hash="$(sha256sum "$target_dir/$path.gz" | head -c 64)"
+		echo " $hash $size $path.gz" >> "$index_files"
+	done
+
+	rm "$release"
+
+	cat <<-EOF | gpg --clearsign > "$target_dir/InRelease"
+	Codename: $timestamp
+	Description: $description
+	Components: main
+	Architectures: all amd64 arm64
+	Date: $(date -R -u -d "$date")
+	Valid-Until: $(date -R -u -d "$date + 100 years")
+	SHA256:
+	$(cat "$index_files")
+	EOF
+
+	rm "$index_files"
+)
+
+main "$@"

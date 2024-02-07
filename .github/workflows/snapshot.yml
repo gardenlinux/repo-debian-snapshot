@@ -1,0 +1,202 @@
+name: snapshot
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *'
+jobs:
+  init:
+    outputs:
+      skip: ${{ steps.skip.outputs.skip }}
+      mirror_matrix: ${{ steps.setup_matrix.outputs.matrix }}
+    runs-on: ubuntu-latest
+    environment: aws
+    permissions:
+      id-token: write
+    env:
+      FILES_PER_MIRROR_JOB: 64
+      MAX_MIRROR_JOBS: 256
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: aws sts get-caller-identity
+      - name: start fetching S3 bucket ${{ vars.S3_BUCKET }} contents
+        id: list_s3
+        run: |
+          fifo="$(mktemp -u)"
+          mkfifo "$fifo"
+          echo "fifo=$fifo" >> "$GITHUB_OUTPUT"
+          aws s3api list-objects --bucket '${{ vars.S3_BUCKET }}' | jq -r '.Contents // [] | .[].Key' | grep -v ' ' | sort > "$fifo" &
+          disown
+      - name: mirror debian testing meta data
+        run: |
+          podman build -t mirror_apt_repo .
+          mkdir repo
+          podman run --rm -e 'AWS_*' \
+            -e 'KMS_KEY_ID=${{ secrets.KMS_KEY_ID }}' \
+            -e 'KMS_KEY_CERT=${{ secrets.KMS_KEY_CERT }}' \
+            -e 'KMS_KEY_GPG=${{ secrets.KMS_KEY_GPG }}' \
+            -v "$PWD/repo:/repo" \
+            mirror_apt_repo -t /repo -i 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+      - id: skip
+        name: check if version already mirrored
+        run: |
+          set -eufo pipefail
+          dist="$(awk -F ': ' '$1 == "Codename" { print $2 }' < repo/InRelease)"
+          if aws s3api head-object --bucket '${{ vars.S3_BUCKET }}' --key "debian-snapshot/dists/$dist/InRelease" > /dev/null 2>&1; then
+            echo "dist $dist already exists" >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: ${{ steps.skip.outputs.skip != 'true' }}
+        name: setup mirror matrix
+        id: setup_matrix
+        run: |
+          set -eufo pipefail
+          join -v 1 <(sort -u < repo/mirrorlist) '${{ steps.list_s3.outputs.fifo }}' > mirrorlist
+          num_files="$(wc -l mirrorlist | awk '{print $1}')"
+          num_jobs="$(( ( num_files + FILES_PER_MIRROR_JOB - 1) / FILES_PER_MIRROR_JOB ))"
+          if [ "$num_jobs" = 0 ]; then
+            echo "matrix=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$num_jobs" -gt "$MAX_MIRROR_JOBS" ]; then num_jobs="$MAX_MIRROR_JOBS"; fi
+          echo "matrix=$(jq -n -c '{"id":[ range('"$num_jobs"') ]}')" >> "$GITHUB_OUTPUT"
+      - if: ${{ steps.skip.outputs.skip != 'true' }}
+        name: pack repo
+        run: |
+          rm repo/mirrorlist
+          tar -c repo | gzip > repo.tar.gz
+          gzip < mirrorlist > mirrorlist.gz
+      - if: ${{ steps.skip.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo
+          path: repo.tar.gz
+      - if: ${{ steps.skip.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mirrorlist
+          path: mirrorlist.gz
+  mirror:
+    needs: init
+    if: ${{ needs.init.outputs.skip != 'true' && needs.init.outputs.mirror_matrix != '' }}
+    runs-on: ubuntu-latest
+    environment: aws
+    permissions:
+      id-token: write
+    strategy:
+      matrix: ${{ fromJson(needs.init.outputs.mirror_matrix) }}
+      fail-fast: false
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: aws sts get-caller-identity
+      - uses: actions/download-artifact@v4
+        with:
+          name: mirrorlist
+      - name: mirror
+        run: |
+          set -eufo pipefail
+          job_id='${{ matrix.id }}'
+          num_jobs="$(echo '${{ needs.init.outputs.mirror_matrix }}' | jq -r '.id | length')"
+          gzip -d < mirrorlist.gz | awk "NR % $num_jobs == $job_id { print }" > mirrorlist
+          num_files="$(wc -l mirrorlist | awk '{ print $1 }')"
+          cntr=0
+          cat mirrorlist | while read -r target source sha256sum; do
+            tmp="$(mktemp)"
+            if [ "$(curl -sSf "$source" | tee "$tmp" | sha256sum | head -c 64)" != "$sha256sum" ]; then
+              echo "invalid sha256sum: $source" >&2
+              exit 1
+            fi
+            echo "$tmp $target"
+          done | while read -r tmp target; do
+            [ -n "$target" ]
+            aws s3 cp --quiet "$tmp" "s3://${{ vars.S3_BUCKET }}/$target"
+            rm "$tmp"
+            cntr="$(( cntr + 1 ))"
+            echo "[$cntr/$num_files] $target"
+          done
+  publish:
+    outputs:
+      dist: ${{ steps.publish.outputs.dist }}
+    needs: [ init, mirror ]
+    if: ${{ always() && needs.init.result == 'success' && (needs.mirror.result == 'success' || needs.mirror.result == 'skipped') && needs.init.outputs.skip != 'true' }}
+    runs-on: ubuntu-latest
+    environment: aws
+    permissions:
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: aws sts get-caller-identity
+      - uses: actions/download-artifact@v4
+        with:
+          name: repo
+      - id: publish
+        name: publish to S3
+        run: |
+          set -eufo pipefail
+          gzip -d < repo.tar.gz | tar -x
+          dist="$(awk -F ': ' '$1 == "Codename" { print $2 }' < repo/InRelease)"
+          echo "dist=$dist" >> "$GITHUB_OUTPUT"
+          if aws s3api head-object --bucket '${{ vars.S3_BUCKET }}' --key "debian-snapshot/dists/$dist/InRelease" > /dev/null 2>&1; then
+            echo "dist $dist already exists" >&2
+            exit 1
+          fi
+          aws s3 cp --recursive repo "s3://${{ vars.S3_BUCKET }}/debian-snapshot/dists/$dist"
+  containerize:
+    name: bootstrap dev container
+    needs: publish
+    if: ${{ always() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: aws
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup binfmt_misc
+        run: sudo podman run --privileged ghcr.io/gardenlinux/binfmt_container >/dev/null 2>&1
+      - name: build
+        run: |
+          dist='${{ needs.publish.outputs.dist }}'
+          echo "$dist" > bootstrap_container/version
+          echo 'https://${{ vars.CLOUDFRONT_URL }}/debian-snapshot' > bootstrap_container/repo
+          cd bootstrap_container
+          ./build --jobs="$(nproc)" --output-sync=target container-amd64 container-arm64
+      - name: load
+        run: |
+          dist='${{ needs.publish.outputs.dist }}'
+          image_amd64="$(podman load < bootstrap_container/.build/container-amd64-*.oci | awk '{ print $NF }')"
+          podman tag "$image_amd64" "ghcr.io/${{ github.repository }}:$dist-amd64"
+          image_arm64="$(podman load < bootstrap_container/.build/container-arm64-*.oci | awk '{ print $NF }')"
+          podman tag "$image_arm64" "ghcr.io/${{ github.repository }}:$dist-arm64"
+      - name: test
+        run: |
+          dist='${{ needs.publish.outputs.dist }}'
+          podman run --rm "ghcr.io/${{ github.repository }}:$dist-amd64" bash -c 'apt-get update && apt-get install -y vim'
+          podman run --rm "ghcr.io/${{ github.repository }}:$dist-arm64" bash -c 'apt-get update && apt-get install -y vim'
+      - name: publish
+        run: |
+          dist='${{ needs.publish.outputs.dist }}'
+          podman login -u token -p ${{ github.token }} ghcr.io
+          podman push "ghcr.io/${{ github.repository }}:$dist-amd64"
+          podman push "ghcr.io/${{ github.repository }}:$dist-arm64"
+          podman manifest create "ghcr.io/${{ github.repository }}:$dist"
+          podman manifest add "ghcr.io/${{ github.repository }}:$dist" "ghcr.io/${{ github.repository }}:$dist-amd64"
+          podman manifest add "ghcr.io/${{ github.repository }}:$dist" "ghcr.io/${{ github.repository }}:$dist-arm64"
+          podman tag "ghcr.io/${{ github.repository }}:$dist" "ghcr.io/${{ github.repository }}"
+          podman push "ghcr.io/${{ github.repository }}:$dist"
+          podman push "ghcr.io/${{ github.repository }}"
+  re-run:
+    needs: [ mirror, publish ]
+    if: failure() && fromJSON(github.run_attempt) < 3
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run rerun.yml -F run_id=${{ github.run_id }}

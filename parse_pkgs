@@ -1,0 +1,73 @@
+#!/usr/bin/env -S awk -f
+
+BEGIN {
+	FS=": "
+}
+
+NF == 0 {
+	if (pkg["Section"] != "games") {
+		directory = "pool/" pkg["SHA256"]
+		if ("is_src" in pkg) {
+			lines = lines "Directory" FS directory RS
+			pkg_id = pkg["Package"] " " pkg["Version"] " " "src"
+			source_files[pkg_id] = pkg["Directory"]
+			target_files[pkg_id] = directory
+			sha256sums[pkg_id] = files
+		} else {
+			filename = directory "/" pkg["Package"] "_" pkg["Version"] "_" pkg["Architecture"] ".deb"
+			lines = lines "Filename" FS filename RS "Size" FS pkg["Size"] RS "SHA256" FS pkg["SHA256"] RS
+			pkg_id = pkg["Package"] " " pkg["Version"] " " pkg["Architecture"]
+			source_files[pkg_id] = pkg["Filename"]
+			target_files[pkg_id] = filename
+			sha256sums[pkg_id] = pkg["SHA256"]
+		}
+		pkgs[pkg_id] = lines
+	}
+	delete pkg
+	lines = ""
+	next
+}
+
+!/^ / {
+	pkg[$1] = $2
+	checksums_flag = 0
+}
+
+$1 !~ /Filename|Size|MD5sum|SHA256|Directory/ {
+	lines = lines $0 RS
+}
+
+$1 ~ /Checksums-Sha256/ {
+	pkg["is_src"] = 1
+	checksums_flag = 1
+	files = ""
+}
+
+checksums_flag && /^ / {
+	split($0, checksum_file, " ")
+	if (checksum_file[3] ~ /\.dsc$/) {
+		pkg["SHA256"] = checksum_file[1]
+	}
+	files = ((files != "") ? files " " : "") checksum_file[1] ":" checksum_file[3]
+}
+
+END {
+	asorti(pkgs, sorted_pkgs)
+	for (i in sorted_pkgs) {
+		pkg_id = sorted_pkgs[i]
+		print pkgs[pkg_id]
+		split(sha256sums[pkg_id], sha256sum_filenames, " ")
+		for (j in sha256sum_filenames) {
+			target_file=target_files[pkg_id]
+			source_file=source_files[pkg_id]
+			split(sha256sum_filenames[j], sha256sum_filename, ":")
+			sha256sum = sha256sum_filename[1]
+			if (2 in sha256sum_filename) {
+				filename = sha256sum_filename[2]
+				target_file = target_file "/" filename
+				source_file = source_file "/" filename
+			}
+			print target_file, source_file_prefix source_file, sha256sum > mirrorlist
+		}
+	}
+}
