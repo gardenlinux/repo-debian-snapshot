@@ -6,11 +6,12 @@ shopt -s nullglob
 exec 3>&1
 exec 1>&2
 
-container_image=ghcr.io/gardenlinux/builder:0068491a60edb7fe57faf2322b100b9509eb55dd
+container_image=ghcr.io/gardenlinux/builder:5dec28a953788d55a93e402fe8182bcbd3e74c39
 container_engine=podman
 target_dir=.build
 
 container_run_opts=(
+	--memory 4G
 	--security-opt seccomp=unconfined
 	--security-opt apparmor=unconfined
 	--security-opt label=disable
@@ -78,14 +79,7 @@ done
 
 if [ "$container_image" = localhost/builder ]; then
 	dir="$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")"
-	# Build from 'builder.dockerfile' if that exists, otherwise the default file name will be 'Dockerfile' or 'Containerfile'.
-	# It is recommended to call the file 'builder.dockerfile' to make it's intention clear.
-	# That file might only contain a single line 'FROM ghcr.io/gardenlinux/builder:...' which can be updated via dependabot.
-	if [[ -f "${dir}"/builder.dockerfile ]]; then
-		"$container_engine" build -t "$container_image" -f "${dir}"/builder.dockerfile "$dir"
-	else 
-		"$container_engine" build -t "$container_image" "$dir"
-	fi
+	"$container_engine" build -t "$container_image" "$dir"
 fi
 
 repo="$(./get_repo)"
