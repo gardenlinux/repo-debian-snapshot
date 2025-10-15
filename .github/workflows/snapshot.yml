@@ -1,6 +1,12 @@
 name: snapshot
 on:
   workflow_dispatch:
+    inputs:
+      force_container:
+        description: "Force building/publishing the container even if the snapshot already exists"
+        type: boolean
+        required: false
+        default: false
   schedule:
     - cron: '0 * * * *'
 jobs:
@@ -8,6 +14,8 @@ jobs:
     outputs:
       skip: ${{ steps.skip.outputs.skip }}
       mirror_matrix: ${{ steps.setup_matrix.outputs.matrix }}
+      dist: ${{ steps.dist.outputs.dist }}
+      force_container: ${{ steps.skip.outputs.force_container }}
     runs-on: ubuntu-latest
     environment: aws
     permissions:
@@ -40,15 +48,22 @@ jobs:
             -e 'KMS_KEY_GPG=${{ secrets.KMS_KEY_GPG }}' \
             -v "$PWD/repo:/repo" \
             mirror_apt_repo -t /repo -i 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+      - id: dist
+        name: extract dist codename
+        run: |
+          set -eufo pipefail
+          dist="$(awk -F ': ' '$1 == "Codename" { print $2 }' < repo/InRelease)"
+          echo "dist=$dist" >> "$GITHUB_OUTPUT"
       - id: skip
         name: check if version already mirrored
         run: |
           set -eufo pipefail
-          dist="$(awk -F ': ' '$1 == "Codename" { print $2 }' < repo/InRelease)"
+          dist='${{ steps.dist.outputs.dist }}'
           if aws s3api head-object --bucket '${{ vars.S3_BUCKET }}' --key "debian-snapshot/dists/$dist/InRelease" > /dev/null 2>&1; then
             echo "dist $dist already exists" >&2
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
+          echo "force_container=${{ inputs.force_container }}"
       - if: ${{ steps.skip.outputs.skip != 'true' }}
         name: setup mirror matrix
         id: setup_matrix
@@ -121,8 +136,6 @@ jobs:
             echo "[$cntr/$num_files] $target"
           done
   publish:
-    outputs:
-      dist: ${{ steps.publish.outputs.dist }}
     needs: [ init, mirror ]
     if: ${{ always() && needs.init.result == 'success' && (needs.mirror.result == 'success' || needs.mirror.result == 'skipped') && needs.init.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
@@ -138,13 +151,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: repo
-      - id: publish
-        name: publish to S3
+      - name: publish to S3
         run: |
           set -eufo pipefail
           gzip -d < repo.tar.gz | tar -x
-          dist="$(awk -F ': ' '$1 == "Codename" { print $2 }' < repo/InRelease)"
-          echo "dist=$dist" >> "$GITHUB_OUTPUT"
+          dist='${{ needs.init.outputs.dist }}'
           if aws s3api head-object --bucket '${{ vars.S3_BUCKET }}' --key "debian-snapshot/dists/$dist/InRelease" > /dev/null 2>&1; then
             echo "dist $dist already exists" >&2
             exit 1
@@ -152,8 +163,8 @@ jobs:
           aws s3 cp --recursive repo "s3://${{ vars.S3_BUCKET }}/debian-snapshot/dists/$dist"
   containerize:
     name: bootstrap dev container
-    needs: publish
-    if: ${{ always() && needs.publish.result == 'success' }}
+    needs: [ init, publish ]
+    if: ${{ always() && needs.init.result == 'success' && ( needs.publish.result == 'success' || needs.init.outputs.force_container == 'true' ) }}
     runs-on: ubuntu-latest
     environment: aws
     steps:
@@ -162,26 +173,26 @@ jobs:
         run: sudo podman run --privileged ghcr.io/gardenlinux/binfmt_container >/dev/null 2>&1
       - name: build
         run: |
-          dist='${{ needs.publish.outputs.dist }}'
+          dist='${{ needs.init.outputs.dist }}'
           echo "$dist" > bootstrap_container/version
           echo 'https://${{ vars.CLOUDFRONT_URL }}/debian-snapshot' > bootstrap_container/repo
           cd bootstrap_container
           ./build --jobs="$(nproc)" --output-sync=target container-amd64 container-arm64
       - name: load
         run: |
-          dist='${{ needs.publish.outputs.dist }}'
+          dist='${{ needs.init.outputs.dist }}'
           image_amd64="$(podman load < bootstrap_container/.build/container-amd64-*.oci | awk '{ print $NF }')"
           podman tag "$image_amd64" "ghcr.io/${{ github.repository }}:$dist-amd64"
           image_arm64="$(podman load < bootstrap_container/.build/container-arm64-*.oci | awk '{ print $NF }')"
           podman tag "$image_arm64" "ghcr.io/${{ github.repository }}:$dist-arm64"
       - name: test
         run: |
-          dist='${{ needs.publish.outputs.dist }}'
+          dist='${{ needs.init.outputs.dist }}'
           podman run --rm "ghcr.io/${{ github.repository }}:$dist-amd64" bash -c 'apt-get update && apt-get install -y vim'
           podman run --rm "ghcr.io/${{ github.repository }}:$dist-arm64" bash -c 'apt-get update && apt-get install -y vim'
       - name: publish
         run: |
-          dist='${{ needs.publish.outputs.dist }}'
+          dist='${{ needs.init.outputs.dist }}'
           podman login -u token -p ${{ github.token }} ghcr.io
           podman push "ghcr.io/${{ github.repository }}:$dist-amd64"
           podman push "ghcr.io/${{ github.repository }}:$dist-arm64"
